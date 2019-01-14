@@ -3,84 +3,94 @@ package network
 import (
 	"github.com/gorilla/websocket"
 	"go.uber.org/atomic"
-	//"golang.org/x/net/websocket"
 	"net/url"
 	"time"
 )
 
-type WSClient struct {
-	addr    string
-	queue   chan *[]byte
+type Client struct {
+	conn    *websocket.Conn
+	queue   chan []byte
 	isClose *atomic.Bool
 }
 
-func NewWSClient(addr string) *WSClient {
-	c :=  &WSClient{
-		addr:    addr,
-		queue:   make(chan *[]byte),
+func NewClient(conn *websocket.Conn) *Client {
+	c := &Client{
+		conn:    conn,
+		queue:   make(chan []byte),
 		isClose: atomic.NewBool(false),
 	}
-	go c.start()
 	return c
 }
 
-func (c *WSClient) start() {
-	u := url.URL{Scheme: "ws", Host: c.addr, Path: "/ws"}
-
-RECONNECT:
-	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
-	//ws, err := websocket.Dial(u.String(), "ws", "ws://"+c.addr+"/")
-	if err != nil {
-		logger.Errorf("connect [%s] error: %s", c.addr, err)
-		time.Sleep(time.Second)
-		goto RECONNECT
-	}
-
-	c.isClose.Store(false)
-
+func (c *Client) Start() {
 	go func() {
 		for {
 			if c.isClose.Load() == true {
 				return
 			}
-
-			data := <-c.queue
-
-			err := conn.WriteMessage(websocket.TextMessage, *data)
-			if err != nil {
-				logger.Errorf("write to [%s] message error:%s", c.addr, err)
-				c.tryClose(conn)
+			data, ok := <-c.queue
+			if !ok {
+				c.Close()
 				return
+			}
+			err := c.conn.WriteMessage(websocket.TextMessage, data)
+			if err != nil {
+				logger.Errorf("send %s message error:%s", c.conn.RemoteAddr(), err)
+				c.Close()
 			}
 		}
 	}()
 
 	for {
-		_, data , err := conn.ReadMessage()
+		_, message, err := c.conn.ReadMessage()
 		if err != nil {
-			logger.Errorf("read to [%s] message error:%s", c.addr, err)
-			c.tryClose(conn)
-		}
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				logger.Infof("connection closed: %s, %v", c.conn.RemoteAddr(), err)
+			} else {
+				logger.Infof("read message error: %s, %v", c.conn.RemoteAddr(), err)
 
-		logger.Infof("msg -> :%s", string(data))
-
-	}
-}
-
-func (c *WSClient) tryClose(conn *websocket.Conn) {
-	if c.isClose.CAS(false, true) {
-		if conn == nil {
+			}
+			c.Close()
 			return
 		}
-		err := conn.Close()
+		logger.Infof("get message %s", string(message))
+		//c.Send(message)
+	}
+}
+
+func (c *Client) Send(data []byte) {
+	if c.isClose.Load() == true {
+		return
+	}
+	c.queue <- data
+}
+
+func (c *Client) Close() {
+	if c.isClose.CAS(false, true) {
+		close(c.queue)
+		err := c.conn.Close()
 		if err != nil {
-			logger.Errorf("close connect [%s] error:%s", c.addr, err)
+			logger.Errorf("close connection %v error:%v", c.conn.RemoteAddr(), err)
 		}
 	}
 }
 
-func (c *WSClient) Send(data []byte) {
-	if c.isClose.Load() == false {
-		c.queue <- &data
+func NewWSConnection(addr string) (*websocket.Conn, error) {
+	u := url.URL{Scheme: "ws", Host: addr, Path: "/ws"}
+	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	return conn, err
+}
+
+func Transport(addr string) *Client {
+RECONNECT:
+	conn, err := NewWSConnection(addr)
+	if err != nil {
+		logger.Errorf("connect [%s] error: %s", addr, err)
+		time.Sleep(time.Second)
+		goto RECONNECT
 	}
+
+	client := NewClient(conn)
+	go client.Start()
+	return client
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"github.com/hyperledger/fabric/common/flogging"
 	"os"
 	"simple_kv/network"
@@ -49,15 +50,16 @@ func main() {
 
 	cls := strings.Split(cluster, ",")
 
-
 	for i, peer := range cls {
 		if i == id-1 {
 			continue
 		}
-
-		wsClient := network.NewWSClient(peer)
-		time.Sleep(time.Second)
-		go wsClient.Send([]byte("hello"))
+		go func(index, id int, addr string) {
+			fmt.Println("--->", index, id, addr)
+			wsClient := network.Transport(addr)
+			time.Sleep(time.Second)
+			go wsClient.Send([]byte(fmt.Sprintf("%d -> %d hello", id, index+1)))
+		}(i, id, peer)
 	}
 
 	logger.Info("---->")
