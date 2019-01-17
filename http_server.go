@@ -31,7 +31,7 @@ func (s *HttpServer) get(c *gin.Context) {
 
 	value := s.kv.Get(key)
 	c.JSON(200, gin.H{
-		"key": key,
+		"key":   key,
 		"value": value,
 	})
 }
@@ -52,7 +52,7 @@ func (s *HttpServer) set(c *gin.Context) {
 	s.kv.Set(key, value)
 
 	c.JSON(200, gin.H{
-		"key": key,
+		"key":   key,
 		"value": value,
 	})
 }
