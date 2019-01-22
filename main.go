@@ -5,7 +5,7 @@ import (
 	"github.com/snlansky/glibs/logging"
 	"net"
 	"net/rpc"
-	"simple_kv/raft"
+	"skv/raft"
 	"strings"
 )
 

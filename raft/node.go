@@ -64,7 +64,7 @@ type Raft struct {
 	votedFor          int        // 在当前任期内收到选票的候选人id（如果没有就为 null）
 	logs              []LogEntry // 日志条目；每个条目包含状态机的要执行命令和从领导人处收到时的任期号
 	commitIndex       int        // 已知的被提交的最大日志条目的索引值（从0开始递增）
-	lastApplied       uint64     // 被状态机执行的最大日志条目的索引值（从0开始递增）
+	lastApplied       int        // 被状态机执行的最大日志条目的索引值（从0开始递增）
 	nextIndexs        []int      // 对于每一个服务器，记录需要发给它的下一个日志条目的索引（初始化为领导人上一条日志的索引值+1）
 	matchIndexs       []int      // 对于每一个服务器，记录已经复制到该服务器的日志的最高索引值（从0开始递增）
 	peers             []RPC
@@ -73,10 +73,11 @@ type Raft struct {
 	voteEvent         chan struct{}
 	voteAcquiredEvent chan struct{}
 	appendEvent       chan struct{}
+	applyChan         chan ApplyMsg
 }
 
-func NewRaft(id int, peers []RPC) *Raft {
-	r := &Raft{
+func NewRaft(id int, peers []RPC, applyChan chan ApplyMsg) *Raft {
+	rf := &Raft{
 		mu:                sync.Mutex{},
 		id:                id,
 		state:             Follower,
@@ -93,9 +94,10 @@ func NewRaft(id int, peers []RPC) *Raft {
 		voteEvent:         make(chan struct{}),
 		voteAcquiredEvent: make(chan struct{}),
 		appendEvent:       make(chan struct{}),
+		applyChan:         applyChan,
 	}
-	go r.loop()
-	return r
+	go rf.loop()
+	return rf
 }
 
 func randElectionDuration() time.Duration {
@@ -103,103 +105,106 @@ func randElectionDuration() time.Duration {
 	return time.Millisecond * time.Duration(r.Int63n(MAX_ELECTION_INTERVAL-MIN_ELECTION_INTERVAL)+MIN_ELECTION_INTERVAL)
 }
 
-func (r *Raft) resetElectionTimer() {
-	r.electionTimer.Reset(randElectionDuration())
+func (rf *Raft) resetElectionTimer() {
+	rf.electionTimer.Reset(randElectionDuration())
 }
 
-func (r *Raft) loop() {
+func (rf *Raft) loop() {
 	ticker := time.NewTicker(HEARTBEAT_INTERVAL * time.Millisecond)
 	for {
-		switch atomic.LoadUint32(&r.state) {
+		switch atomic.LoadUint32(&rf.state) {
 		case Follower:
 			select {
-			case <-r.voteEvent:
-				r.resetElectionTimer()
-			case <-r.appendEvent:
-				r.resetElectionTimer()
-			case <-r.electionTimer.C:
-				r.resetElectionTimer()
-				r.updateStateTo(Candidate)
-				r.startElection()
+			case <-rf.voteEvent:
+				rf.resetElectionTimer()
+			case <-rf.appendEvent:
+				rf.resetElectionTimer()
+				rf.applyLog()
+			case <-rf.electionTimer.C:
+				rf.resetElectionTimer()
+				rf.updateStateTo(Candidate)
+				rf.startElection()
 			}
 		case Candidate:
 			select {
-			case <-r.voteAcquiredEvent:
-				if atomic.LoadUint32(&r.voteAcquired) > uint32(len(r.peers)/2) {
-					r.updateStateTo(Leader)
-					r.broadcastAppendEntries()
+			case <-rf.voteAcquiredEvent:
+				if atomic.LoadUint32(&rf.voteAcquired) > uint32(len(rf.peers)/2) {
+					rf.updateStateTo(Leader)
+					rf.broadcastAppendEntries()
 				}
-			case <-r.appendEvent:
-				r.updateStateTo(Follower)
-			case <-r.electionTimer.C:
-				r.electionTimer.Reset(randElectionDuration())
-				r.startElection()
+			case <-rf.appendEvent:
+				rf.updateStateTo(Follower)
+				rf.applyLog()
+			case <-rf.electionTimer.C:
+				rf.electionTimer.Reset(randElectionDuration())
+				rf.startElection()
 			}
 		case Leader:
 			<-ticker.C
-			r.broadcastAppendEntries()
-			r.updateCommitIndex()
+			rf.broadcastAppendEntries()
+			rf.updateCommitIndex()
+			rf.applyLog()
 		}
 	}
 }
 
-func (r *Raft) updateStateTo(state uint32) {
+func (rf *Raft) updateStateTo(state uint32) {
 	stateDesc := []string{"FOLLOWER", "CANDIDATE", "LEADER"}
 	for {
-		old := atomic.LoadUint32(&r.state)
+		old := atomic.LoadUint32(&rf.state)
 		if old == state {
 			return
 		}
-		if atomic.CompareAndSwapUint32(&r.state, old, state) {
+		if atomic.CompareAndSwapUint32(&rf.state, old, state) {
 			switch state {
 			case Follower:
-				r.votedFor = -1
+				rf.votedFor = -1
 			case Candidate:
 			case Leader:
-				r.votedFor = -1
-				for i := range r.peers {
-					r.nextIndexs[i] = r.getLastLogIndex() + 1
-					r.matchIndexs[i] = 0
+				rf.votedFor = -1
+				for i := range rf.peers {
+					rf.nextIndexs[i] = rf.getLastLogIndex() + 1
+					rf.matchIndexs[i] = 0
 				}
-				atomic.StoreUint32(&r.voteAcquired, 0)
+				atomic.StoreUint32(&rf.voteAcquired, 0)
 			}
 
-			logger.Infof("-> update state %s -> %s, vote for %d", stateDesc[old], stateDesc[state], r.votedFor)
+			logger.Infof("-> update state %s -> %s, vote for %d", stateDesc[old], stateDesc[state], rf.votedFor)
 			return
 		}
 	}
 }
 
-func (r *Raft) startElection() {
-	r.mu.Lock()
-	r.currentTerm += 1
-	r.votedFor = r.id
-	r.voteAcquired = 1
-	r.mu.Unlock()
+func (rf *Raft) startElection() {
+	rf.mu.Lock()
+	rf.currentTerm += 1
+	rf.votedFor = rf.id
+	rf.voteAcquired = 1
+	rf.mu.Unlock()
 
-	lastLogIndex := r.getLastLogIndex()
+	lastLogIndex := rf.getLastLogIndex()
 	args := RequestVoteArgs{
-		Term:         r.currentTerm,
-		CandidateId:  r.id,
+		Term:         rf.currentTerm,
+		CandidateId:  rf.id,
 		LastLogIndex: lastLogIndex,
-		LastLogTerm:  r.logs[lastLogIndex].Term,
+		LastLogTerm:  rf.logs[lastLogIndex].Term,
 	}
 
 	f := func(id int, peer RPC) {
 		var reply VoteResponse
 		if err := peer.Call("Raft.RequestVote", &args, &reply); err == nil {
-			r.mu.Lock()
-			defer r.mu.Unlock()
-			if !r.isState(Candidate) {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if !rf.isState(Candidate) {
 				return
 			}
 			if reply.VoteGranted {
-				r.voteAcquired += 1
-				r.voteAcquiredEvent <- struct{}{}
+				rf.voteAcquired += 1
+				rf.voteAcquiredEvent <- struct{}{}
 			} else {
-				if reply.Term > r.currentTerm {
-					r.currentTerm = reply.Term
-					r.updateStateTo(Follower)
+				if reply.Term > rf.currentTerm {
+					rf.currentTerm = reply.Term
+					rf.updateStateTo(Follower)
 				}
 			}
 		} else {
@@ -208,27 +213,27 @@ func (r *Raft) startElection() {
 
 	}
 
-	r.broadcast(f)
+	rf.broadcast(f)
 }
 
-func (r *Raft) RequestVote(args *RequestVoteArgs, reply *VoteResponse) error {
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *VoteResponse) error {
 	//logger.Infof("get request vote from [%d], term [%d]", args.CandidateId, args.Term)
-	r.mu.Lock()
-	r.mu.Unlock()
+	rf.mu.Lock()
+	rf.mu.Unlock()
 
-	reply.Term = r.currentTerm
+	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
-	if args.Term < r.currentTerm {
+	if args.Term < rf.currentTerm {
 		return nil
-	} else if args.Term > r.currentTerm {
-		r.currentTerm = args.Term
-		r.updateStateTo(Follower)
-		r.votedFor = args.CandidateId
+	} else if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.updateStateTo(Follower)
+		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 	} else {
-		if r.votedFor == -1 {
-			r.votedFor = args.CandidateId
+		if rf.votedFor == -1 {
+			rf.votedFor = args.CandidateId
 			reply.VoteGranted = true
 		} else {
 			// 说明同时有多个节点发起投票
@@ -236,51 +241,51 @@ func (r *Raft) RequestVote(args *RequestVoteArgs, reply *VoteResponse) error {
 		}
 	}
 
-	lastLogTerm := r.logs[r.getLastLogIndex()].Term
+	lastLogTerm := rf.logs[rf.getLastLogIndex()].Term
 	if lastLogTerm > args.LastLogTerm {
 		reply.VoteGranted = false
 	} else if lastLogTerm == args.LastLogTerm {
-		if r.getLastLogIndex() > args.LastLogIndex {
+		if rf.getLastLogIndex() > args.LastLogIndex {
 			reply.VoteGranted = false
 		}
 	}
 
 	if reply.VoteGranted == true {
 		go func() {
-			r.voteEvent <- struct{}{}
+			rf.voteEvent <- struct{}{}
 		}()
 	}
 
 	return nil
 }
 
-func (r *Raft) broadcastAppendEntries() {
+func (rf *Raft) broadcastAppendEntries() {
 	f := func(id int, peer RPC) {
 		var args AppendEntriesArgs
-		r.mu.Lock()
-		args.Term = r.currentTerm
-		args.LeaderId = r.id
-		args.LeaderCommit = r.commitIndex
-		args.PrevLogIndex = r.nextIndexs[id] - 1
-		args.PrevLogTerm = r.logs[args.PrevLogIndex].Term
-		if r.getLastLogIndex() >= r.nextIndexs[id] {
-			args.Entries = r.logs[r.nextIndexs[id]:]
+		rf.mu.Lock()
+		args.Term = rf.currentTerm
+		args.LeaderId = rf.id
+		args.LeaderCommit = rf.commitIndex
+		args.PrevLogIndex = rf.nextIndexs[id] - 1
+		args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
+		if rf.getLastLogIndex() >= rf.nextIndexs[id] {
+			args.Entries = rf.logs[rf.nextIndexs[id]:]
 		}
-		r.mu.Unlock()
+		rf.mu.Unlock()
 		var reply AppendEntriesReply
 		if err := peer.Call("Raft.AppendEntries", &args, &reply); err == nil {
-			r.mu.Lock()
-			defer r.mu.Unlock()
-			if !r.isState(Leader) {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if !rf.isState(Leader) {
 				return
 			}
 			if reply.Success {
-				r.nextIndexs[id] += len(args.Entries)
-				r.matchIndexs[id] = r.nextIndexs[id] - 1
+				rf.nextIndexs[id] += len(args.Entries)
+				rf.matchIndexs[id] = rf.nextIndexs[id] - 1
 			} else {
-				if reply.Term > r.currentTerm {
-					r.currentTerm = reply.Term
-					r.updateStateTo(Follower)
+				if reply.Term > rf.currentTerm {
+					rf.currentTerm = reply.Term
+					rf.updateStateTo(Follower)
 				}
 			}
 		} else {
@@ -288,45 +293,45 @@ func (r *Raft) broadcastAppendEntries() {
 		}
 	}
 
-	r.broadcast(f)
+	rf.broadcast(f)
 }
 
-func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
 	//logger.Infof("get append entries from [%d], term [%d]", args.LeaderId, args.Term)
 	defer func() {
-		r.appendEvent <- struct{}{}
+		rf.appendEvent <- struct{}{}
 	}()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if args.Term < r.currentTerm {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term < rf.currentTerm {
 		reply.Success = false
-		reply.Term = r.currentTerm
-	} else if args.Term > r.currentTerm {
+		reply.Term = rf.currentTerm
+	} else if args.Term > rf.currentTerm {
 		reply.Success = true
-		r.currentTerm = args.Term
-		r.updateStateTo(Follower)
+		rf.currentTerm = args.Term
+		rf.updateStateTo(Follower)
 	} else {
 		reply.Success = true
 	}
 
 	// 如果在prevLogIndex处的日志的任期号与prevLogTerm不匹配时，返回 false（5.3节）
-	if args.PrevLogIndex > r.getLastLogIndex() {
+	if args.PrevLogIndex > rf.getLastLogIndex() {
 		reply.Success = false
 		return nil
 	}
 
-	if args.PrevLogTerm != r.logs[args.PrevLogTerm].Term {
+	if args.PrevLogTerm != rf.logs[args.PrevLogTerm].Term {
 		reply.Success = false
 		return nil
 	}
 
 	// 如果一条已经存在的日志与新的冲突（index 相同但是任期号 term 不同），则删除已经存在的日志和它之后所有的日志（5.3节）
 	conflict := -1
-	if r.getLastLogIndex() < args.PrevLogIndex+len(args.Entries) {
+	if rf.getLastLogIndex() < args.PrevLogIndex+len(args.Entries) {
 		conflict = args.PrevLogIndex + 1
 	} else {
 		for idx := 0; idx < len(args.Entries); idx++ {
-			if r.logs[idx+args.PrevLogIndex+1].Term != args.Entries[idx].Term {
+			if rf.logs[idx+args.PrevLogIndex+1].Term != args.Entries[idx].Term {
 				conflict = idx + args.PrevLogIndex + 1
 				break
 			}
@@ -334,53 +339,68 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 	}
 	// 添加任何在已有的日志中不存在的条目
 	if conflict != -1 {
-		r.logs = append(r.logs[:args.PrevLogIndex+1], args.Entries...)
+		rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
 	}
 	// 如果leaderCommit > commitIndex，将commitIndex设置为leaderCommit和最新日志条目索引号中较小的一个
-	if args.LeaderCommit > r.commitIndex {
-		if args.LeaderCommit < r.getLastLogIndex() {
-			r.commitIndex = r.getLastLogIndex()
+	if args.LeaderCommit > rf.commitIndex {
+		if args.LeaderCommit < rf.getLastLogIndex() {
+			rf.commitIndex = rf.getLastLogIndex()
 		} else {
-			r.commitIndex = args.LeaderCommit
+			rf.commitIndex = args.LeaderCommit
 		}
 	}
 	return nil
 }
-func (r *Raft) updateCommitIndex() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for i := r.getLastLogIndex(); i > r.commitIndex; i-- {
+func (rf *Raft) updateCommitIndex() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	for i := rf.getLastLogIndex(); i > rf.commitIndex; i-- {
 		match := 1
-		for i, matched := range r.matchIndexs {
-			if i == r.id {
+		for i, matched := range rf.matchIndexs {
+			if i == rf.id {
 				continue
 			}
-			if matched > r.commitIndex {
+			if matched > rf.commitIndex {
 				match++
 			}
 		}
-		if match > len(r.peers)/2 {
-			r.commitIndex = i
+		if match > len(rf.peers)/2 {
+			rf.commitIndex = i
 		}
 	}
 
 }
 
-func (r *Raft) broadcast(f func(id int, peer RPC)) {
-	for index, peer := range r.peers {
-		if index == r.id {
+func (rf *Raft) broadcast(f func(id int, peer RPC)) {
+	for index, peer := range rf.peers {
+		if index == rf.id {
 			continue
 		}
 		go f(index, peer)
 	}
 }
 
-func (r *Raft) isState(state uint32) bool {
-	return atomic.LoadUint32(&r.state) == state
+func (rf *Raft) isState(state uint32) bool {
+	return atomic.LoadUint32(&rf.state) == state
 }
 
-func (r *Raft) getLastLogIndex() int {
-	return len(r.logs) - 1
+func (rf *Raft) getLastLogIndex() int {
+	return len(rf.logs) - 1
+}
+
+func (rf *Raft) applyLog() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.commitIndex > rf.lastApplied {
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			var msg ApplyMsg
+			msg.Index = i
+			msg.Command = rf.logs[i].Command
+			rf.applyChan <- msg
+			rf.lastApplied = i
+		}
+	}
 }
 
 //func (r *Raft) InstallSnapshotRPC(s *Snapshot) *InstallSnapshotResponse {

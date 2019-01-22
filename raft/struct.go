@@ -56,3 +56,8 @@ type Message struct {
 }
 
 type MessageType int
+
+type ApplyMsg struct {
+	Index int
+	Command interface{}
+}
