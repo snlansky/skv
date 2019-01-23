@@ -56,15 +56,6 @@ func main() {
 
 	id = id - 1
 
-	//node := raft.NewNode()
-	//server := NewHttpServer(node)
-	//go func() {
-	//	err := server.start(port)
-	//	if err != nil {
-	//		logger.Error(err)
-	//	}
-	//}()
-
 	addrs := strings.Split(cluster, ",")
 
 	ln, err := net.Listen("tcp", addrs[id])
@@ -83,12 +74,22 @@ func main() {
 		}(i, addr)
 	}
 
-	r := raft.NewRaft(id, peer)
+	applyChan := make(chan raft.ApplyMsg)
+	rf := raft.NewRaft(id, peer, applyChan)
 	rpcServer := rpc.NewServer()
-	err = rpcServer.Register(r)
+	err = rpcServer.Register(rf)
 	if err != nil {
 		logger.Fatalf("rps register error:%s", err)
 	}
+
+	kv := NewMemKV(rf, applyChan)
+	server := NewHttpServer(kv)
+	go func() {
+		err := server.start(port)
+		if err != nil {
+			logger.Error(err)
+		}
+	}()
 
 	for {
 		conn, err := ln.Accept()

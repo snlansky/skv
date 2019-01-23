@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"errors"
 	"github.com/snlansky/glibs/logging"
 	"math/rand"
 	"sync"
@@ -19,42 +20,6 @@ const (
 	MIN_ELECTION_INTERVAL = 4000
 	MAX_ELECTION_INTERVAL = 5000
 )
-
-type Node struct {
-	isLeader bool
-	kv       map[string]string
-	mu       sync.RWMutex
-}
-
-func NewNode() *Node {
-	n := Node{
-		isLeader: false,
-		kv:       map[string]string{},
-	}
-	return &n
-}
-
-func (n *Node) Set(key, value string) {
-	n.mu.Lock()
-	n.kv[key] = value
-	n.mu.Unlock()
-}
-
-func (n *Node) Get(key string) string {
-	n.mu.RLock()
-	value, ok := n.kv[key]
-	n.mu.RUnlock()
-	if !ok {
-		return ""
-	}
-	return value
-}
-
-func (n *Node) Delete(key string) {
-	n.mu.Lock()
-	delete(n.kv, key)
-	n.mu.Unlock()
-}
 
 type Raft struct {
 	mu                sync.Mutex
@@ -98,6 +63,21 @@ func NewRaft(id int, peers []RPC, applyChan chan ApplyMsg) *Raft {
 	}
 	go rf.loop()
 	return rf
+}
+
+func (rf *Raft) ProposalCommand(command []byte) error {
+	if rf.isState(Leader) {
+		rf.mu.Lock()
+		log := LogEntry{Term: rf.currentTerm, Command: command}
+		rf.logs = append(rf.logs, log)
+		index := len(rf.logs)
+		rf.nextIndexs[rf.id] = index + 1
+		rf.matchIndexs[rf.id] = index
+		rf.mu.Unlock()
+	} else {
+		return errors.New("forbid proposal")
+	}
+	return nil
 }
 
 func randElectionDuration() time.Duration {
@@ -399,16 +379,7 @@ func (rf *Raft) applyLog() {
 			msg.Command = rf.logs[i].Command
 			rf.applyChan <- msg
 			rf.lastApplied = i
+			logger.Infof("commit command:%s", string(msg.Command))
 		}
 	}
 }
-
-//func (r *Raft) InstallSnapshotRPC(s *Snapshot) *InstallSnapshotResponse {
-//	resp := new(InstallSnapshotResponse)
-//	resp.Term = r.currentTerm
-//
-//	if s.Term < r.currentTerm {
-//		return resp
-//	}
-//
-//}

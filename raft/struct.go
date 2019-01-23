@@ -4,19 +4,22 @@ type RPC interface {
 	Call(serviceMethod string, args interface{}, reply interface{}) error
 }
 
+type Proposal interface {
+	ProposalCommand(command []byte) error
+}
+
 type LogEntry struct {
-	Term    int
-	Index   int
-	Command interface{}
+	Term    uint64
+	Command []byte
 }
 
 type AppendEntriesArgs struct {
 	Term         uint64     // 领导人的任期号
-	LeaderId     int     // 领导人的 id，为了其他服务器能重定向到客户端
-	PrevLogIndex int     // 最新日志之前的日志的索引值
-	PrevLogTerm  int     // 最新日志之前的日志的领导人任期号
+	LeaderId     int        // 领导人的 id，为了其他服务器能重定向到客户端
+	PrevLogIndex int        // 最新日志之前的日志的索引值
+	PrevLogTerm  uint64     // 最新日志之前的日志的领导人任期号
 	Entries      []LogEntry // 将要存储的日志条目（表示 heartbeat 时为空，有时会为了效率发送超过一条）
-	LeaderCommit int     // 领导人提交的日志条目索引值
+	LeaderCommit int        // 领导人提交的日志条目索引值
 }
 
 type AppendEntriesReply struct {
@@ -28,7 +31,7 @@ type RequestVoteArgs struct {
 	Term         uint64 // 候选人的任期号
 	CandidateId  int    // 请求投票的候选人 id
 	LastLogIndex int    // 候选人最新日志条目的索引值
-	LastLogTerm  int    // 候选人最新日志条目对应的任期号
+	LastLogTerm  uint64 // 候选人最新日志条目对应的任期号
 }
 
 type VoteResponse struct {
@@ -58,6 +61,6 @@ type Message struct {
 type MessageType int
 
 type ApplyMsg struct {
-	Index int
-	Command interface{}
+	Index   int
+	Command []byte
 }
